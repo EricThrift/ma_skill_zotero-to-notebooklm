@@ -84,6 +84,60 @@ def label_source(notebook_id, source_title, collection_name):
         print(f"Warning: Failed to move source to label: {res_move.stderr}")
         return False
 
+def attempt_resize_pdf(input_path, output_path):
+    # Attempt 1: Native pypdf compression if installed
+    try:
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(input_path)
+        writer = PdfWriter()
+        for page in reader.pages:
+            page.compress_content_streams()
+            writer.add_page(page)
+        with open(output_path, "wb") as f:
+            writer.write(f)
+        if os.path.exists(output_path) and os.path.getsize(output_path) < 25 * 1024 * 1024:
+            print("Successfully compressed PDF using pypdf.")
+            return True
+    except Exception as e:
+        print(f"pypdf compression attempt failed/skipped: {e}")
+        
+    # Attempt 2: Ghostscript CLI if available
+    try:
+        cmd = [
+            "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+            "-dPDFSETTINGS=/screen", "-dNOPAUSE", "-dQUIET", "-dBATCH",
+            f"-sOutputFile={output_path}", input_path
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0 and os.path.exists(output_path):
+            if os.path.getsize(output_path) < 25 * 1024 * 1024:
+                print("Successfully compressed PDF using Ghostscript.")
+                return True
+    except Exception:
+        pass
+    return False
+
+def get_zotero_text(att_folder):
+    cache_path = os.path.join(att_folder, ".zotero-ft-cache")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return f.read(), ".zotero-ft-cache"
+        except Exception as e:
+            print(f"Error reading Zotero cache {cache_path}: {e}")
+            
+    unproc_path = os.path.join(att_folder, ".zotero-ft-unprocessed")
+    if os.path.exists(unproc_path):
+        try:
+            with open(unproc_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "text" in data:
+                    return data["text"], ".zotero-ft-unprocessed"
+        except Exception as e:
+            print(f"Error reading Zotero unprocessed {unproc_path}: {e}")
+            
+    return None, None
+
 def main():
     parser = argparse.ArgumentParser(description="Upload PDFs in a Zotero collection to NotebookLM")
     parser.add_argument("--collection-id", type=int, required=True, help="Zotero Collection Database ID (e.g., 858)")
@@ -248,20 +302,75 @@ def main():
     conn.close()
     os.remove(temp_db)
 
-    print(f"\nUploading {len(to_upload)} PDF attachments to NotebookLM...")
+    print(f"\nProcessing {len(to_upload)} PDF attachments for NotebookLM...")
     uploaded_count = 0
     uploaded_metadata = []
+    failed_items = []
+    
+    output_file = "zotero_uploaded_items.json"
     
     for file_path, target_title, parent_key, author, date, type_name, title in to_upload:
-        print(f"[{uploaded_count+1}/{len(to_upload)}] Uploading '{target_title}'...")
+        print(f"[{uploaded_count+len(failed_items)+1}/{len(to_upload)}] Processing '{target_title}'...")
+        
+        file_size = os.path.getsize(file_path)
+        upload_path = file_path
+        temp_txt_path = None
+        
+        # Check size constraints
+        if file_size > 25 * 1024 * 1024:
+            print(f"Source file is too large: {file_size / (1024*1024):.1f}MB (limit: 25MB)")
+            
+            resized_path = file_path + ".resized.pdf"
+            print("Attempting to resize PDF to fit size limit...")
+            if attempt_resize_pdf(file_path, resized_path):
+                print("Successfully resized PDF!")
+                upload_path = resized_path
+            else:
+                print("Could not resize PDF. Attempting to retrieve full-text content from Zotero storage...")
+                att_folder = os.path.dirname(file_path)
+                extracted_text, source_file = get_zotero_text(att_folder)
+                if extracted_text:
+                    print(f"Found Zotero extracted text in {source_file}!")
+                    temp_txt_path = os.path.join(os.path.dirname(output_file) or ".", f"{target_title}.txt")
+                    try:
+                        with open(temp_txt_path, "w", encoding="utf-8") as f:
+                            f.write(extracted_text)
+                        upload_path = temp_txt_path
+                    except Exception as e:
+                        print(f"Error writing temporary text file: {e}")
+                        upload_path = None
+                else:
+                    print("Warning: No extracted full-text content found in Zotero storage directory.")
+                    upload_path = None
+                    
+        if not upload_path:
+            print(f"Error: PDF is too large and text content could not be retrieved. Skipping {target_title}.")
+            failed_items.append(f"{target_title} (File too large, failed to resize/extract text)")
+            continue
+
+        print(f"Uploading '{target_title}' to NotebookLM...")
         cmd_upload = [
             "uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "source", "add",
             notebook_id,
-            "--file", file_path,
+            "--file", upload_path,
             "--title", target_title,
             "--wait"
         ]
         res_upload = subprocess.run(cmd_upload, capture_output=True, text=True, encoding="utf-8")
+        
+        # Clean up temp files
+        if temp_txt_path and os.path.exists(temp_txt_path):
+            try:
+                os.remove(temp_txt_path)
+            except Exception:
+                pass
+        resized_temp = file_path + ".resized.pdf"
+        if os.path.exists(resized_temp):
+            try:
+                os.remove(resized_temp)
+            except Exception:
+                pass
+
         if res_upload.returncode == 0:
             print(f"Successfully uploaded: {target_title}")
             # Assign label to source in NotebookLM
@@ -278,8 +387,9 @@ def main():
         else:
             print(f"Failed to upload {target_title}:")
             print(res_upload.stderr)
+            failed_items.append(f"{target_title} (NotebookLM upload command failed: {res_upload.stderr.strip()})")
 
-    print(f"\nSuccess! Uploaded {uploaded_count} PDFs to notebook '{args.notebook_name}'.")
+    print(f"\nSuccess! Uploaded {uploaded_count} sources to notebook '{args.notebook_name}'.")
 
     if uploaded_metadata:
         # Load existing metadata if file exists
@@ -289,7 +399,6 @@ def main():
         }
         source_libraries = []
         
-        output_file = "zotero_uploaded_items.json"
         if os.path.exists(output_file):
             try:
                 with open(output_file, "r", encoding="utf-8") as f:
@@ -358,6 +467,13 @@ def main():
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(output_data, f, indent=2, ensure_ascii=False)
         print(f"Recorded metadata for {len(uploaded_metadata)} uploaded items in {output_file}")
+
+    if failed_items:
+        print("\n" + "="*80)
+        print("ALERT: The following sources in the Zotero collection were ignored or not successfully uploaded:")
+        for item in failed_items:
+            print(f" - {item}")
+        print("="*80 + "\n")
 
 if __name__ == "__main__":
     main()

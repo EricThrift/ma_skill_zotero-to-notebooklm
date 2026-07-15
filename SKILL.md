@@ -13,6 +13,14 @@ This skill automates the transfer of PDF attachments from a specified Zotero col
 2. **NotebookLM CLI**: The `notebooklm-mcp-cli` package must be installed and authenticated.
    * Run `uvx --link-mode=copy --from notebooklm-mcp-cli nlm doctor` to check status.
    * Run `uvx --link-mode=copy --from notebooklm-mcp-cli nlm login` if authentication is missing or expired.
+3. **Python Virtual Environment & pypdf**: Required for native PDF compression.
+   * Create a virtual environment and install dependencies:
+     ```bash
+     python -m venv .venv
+     .venv\Scripts\pip install -r .agents/skills/ma_skill_zotero-to-notebooklm/requirements.txt
+     ```
+4. **Ghostscript (Optional)**: System-level PDF compression tool used as a fallback if `pypdf` is not installed or fails.
+   * Can be downloaded and installed from the official Ghostscript website.
 
 ## Usage
 
