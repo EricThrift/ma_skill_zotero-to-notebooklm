@@ -226,13 +226,20 @@ def main():
             return
         with open(output_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-        notebook = data.get("target_notebook", {})
-        print(f"Target NotebookLM Notebook: {notebook.get('name')} (ID: {notebook.get('notebook_id')})")
-        print("\nSynchronized Zotero Collections:")
-        for lib in data.get("source_libraries", []):
-            print(f"Group Library: {lib.get('name')} (groupID: {lib.get('groupID')})")
-            for col in lib.get("collections", []):
-                print(f"  - Collection: {col.get('name')} (key: {col.get('collection_key')}) - {len(col.get('uploaded_items', []))} items")
+            
+        if "source_library" in data:
+            lib = data["source_library"]
+            print(f"Target NotebookLM Notebook: {lib.get('name')}")
+            print("\nSynchronized Zotero Collections:")
+            print(f"  - Collection: {lib.get('name')} (key: {lib.get('collection_key')}) - {len(data.get('uploaded_items', []))} items")
+        else:
+            notebook = data.get("target_notebook", {})
+            print(f"Target NotebookLM Notebook: {notebook.get('name')} (ID: {notebook.get('notebook_id')})")
+            print("\nSynchronized Zotero Collections:")
+            for lib in data.get("source_libraries", []):
+                print(f"Group Library: {lib.get('name')} (groupID: {lib.get('groupID')})")
+                for col in lib.get("collections", []):
+                    print(f"  - Collection: {col.get('name')} (key: {col.get('collection_key')}) - {len(col.get('uploaded_items', []))} items")
         return
 
     # Check NotebookLM CLI auth
@@ -243,32 +250,40 @@ def main():
         print(res_info.stderr)
         sys.exit(1)
 
-    # Load existing mapping
+    # Load existing mapping supporting both schemas
     mapping_data = {
-        "target_notebook": {
-            "notebook_id": "PLACEHOLDER_NOTEBOOK_ID",
-            "name": "Restorative cataloguing"
+        "source_library": {
+            "groupID": int(library_id) if library_type == "group" else 0,
+            "collection_key": "PLACEHOLDER",
+            "name": args.collection_name or "Restorative cataloguing"
         },
-        "source_libraries": []
+        "uploaded_items": []
     }
+    
     if os.path.exists(output_file):
         try:
             with open(output_file, "r", encoding="utf-8") as f:
-                mapping_data = json.load(f)
+                loaded = json.load(f)
+                if "source_library" in loaded:
+                    mapping_data["source_library"] = loaded["source_library"]
+                if "uploaded_items" in loaded:
+                    mapping_data["uploaded_items"] = loaded["uploaded_items"]
+                elif "source_libraries" in loaded:
+                    # Fallback for older nested schema
+                    uploaded = []
+                    for lib in loaded.get("source_libraries", []):
+                        for col in lib.get("collections", []):
+                            uploaded.extend(col.get("uploaded_items", []))
+                    mapping_data["uploaded_items"] = uploaded
         except Exception as e:
             print(f"Warning: Could not read {output_file}: {e}")
 
-    notebook_name = mapping_data["target_notebook"].get("name", "Restorative cataloguing")
-    notebook_id = mapping_data["target_notebook"].get("notebook_id")
-    if not notebook_id or notebook_id == "PLACEHOLDER_NOTEBOOK_ID":
-        print(f"Resolving Notebook ID for '{notebook_name}'...")
-        notebook_id = resolve_notebook_id(notebook_name)
-        if not notebook_id:
-            print(f"Error: Could not find or resolve NotebookLM notebook named '{notebook_name}'.")
-            sys.exit(1)
-        mapping_data["target_notebook"]["notebook_id"] = notebook_id
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(mapping_data, f, indent=2, ensure_ascii=False)
+    notebook_name = args.collection_name or mapping_data["source_library"].get("name", "Restorative cataloguing")
+    print(f"Resolving Notebook ID for '{notebook_name}'...")
+    notebook_id = resolve_notebook_id(notebook_name)
+    if not notebook_id:
+        print(f"Error: Could not find or resolve NotebookLM notebook named '{notebook_name}'.")
+        sys.exit(1)
 
     print(f"Target Notebook ID: {notebook_id}")
 
@@ -291,7 +306,7 @@ def main():
     if args.collection_name:
         matched_col = None
         for col in collections:
-            if col["data"]["name"] == args.collection_name:
+            if col["data"]["name"].lower() == args.collection_name.lower():
                 matched_col = col
                 break
         if not matched_col:
@@ -305,28 +320,23 @@ def main():
             "group_name": "Group Library" if library_type == "group" else "My Library"
         })
     else:  # --all
-        mapped_collection_keys = []
-        for lib in mapping_data.get("source_libraries", []):
-            for col in lib.get("collections", []):
-                mapped_collection_keys.append(col.get("collection_key"))
-                
-        if not mapped_collection_keys:
+        col_key = mapping_data["source_library"].get("collection_key")
+        if not col_key or col_key == "PLACEHOLDER":
             print("No collections registered in zotero_uploaded_items.json to sync.")
             return
             
-        for col_key in mapped_collection_keys:
-            matched_col = None
-            for col in collections:
-                if col["key"] == col_key:
-                    matched_col = col
-                    break
-            if matched_col:
-                collections_to_sync.append({
-                    "collection_key": col_key,
-                    "collection_name": matched_col["data"]["name"],
-                    "groupID": int(library_id) if library_type == "group" else 0,
-                    "group_name": "Group Library" if library_type == "group" else "My Library"
-                })
+        matched_col = None
+        for col in collections:
+            if col["key"] == col_key:
+                matched_col = col
+                break
+        if matched_col:
+            collections_to_sync.append({
+                "collection_key": col_key,
+                "collection_name": matched_col["data"]["name"],
+                "groupID": int(library_id) if library_type == "group" else 0,
+                "group_name": "Group Library" if library_type == "group" else "My Library"
+            })
 
     all_failed_items = []
 
@@ -335,25 +345,11 @@ def main():
         col_key = col_info["collection_key"]
         col_name = col_info["collection_name"]
         group_id = col_info["groupID"]
-        group_name = col_info["group_name"]
         
         print(f"\nSyncing collection '{col_name}' ({col_key})...")
         
         # Get existing keys in mapping
-        existing_keys = set()
-        lib_entry = None
-        for lib in mapping_data.get("source_libraries", []):
-            if lib.get("groupID") == group_id:
-                lib_entry = lib
-                break
-        if lib_entry:
-            col_entry = None
-            for col in lib_entry.get("collections", []):
-                if col.get("collection_key") == col_key:
-                    col_entry = col
-                    break
-            if col_entry:
-                existing_keys = {item["zotero_key"] for item in col_entry.get("uploaded_items", [])}
+        existing_keys = {item["zotero_key"] for item in mapping_data.get("uploaded_items", [])}
 
         # Query all items in this collection via Web API
         print("Fetching collection items...")
@@ -511,36 +507,16 @@ def main():
 
         # Merge results into mapping_data
         if uploaded_metadata:
-            lib_entry = None
-            for lib in mapping_data.get("source_libraries", []):
-                if lib.get("groupID") == group_id:
-                    lib_entry = lib
-                    break
-            if not lib_entry:
-                lib_entry = {
-                    "groupID": group_id,
-                    "name": col_info["group_name"],
-                    "collections": []
-                }
-                mapping_data["source_libraries"].append(lib_entry)
-                
-            col_entry = None
-            for col in lib_entry.get("collections", []):
-                if col.get("collection_key") == col_key:
-                    col_entry = col
-                    break
-            if not col_entry:
-                col_entry = {
-                    "collection_key": col_key,
-                    "name": col_name,
-                    "uploaded_items": []
-                }
-                lib_entry["collections"].append(col_entry)
-                
-            existing_items_dict = {item["zotero_key"]: item for item in col_entry["uploaded_items"]}
+            mapping_data["source_library"] = {
+                "groupID": group_id,
+                "collection_key": col_key,
+                "name": col_name
+            }
+            
+            existing_items_dict = {item["zotero_key"]: item for item in mapping_data["uploaded_items"]}
             for item in uploaded_metadata:
                 existing_items_dict[item["zotero_key"]] = item
-            col_entry["uploaded_items"] = list(existing_items_dict.values())
+            mapping_data["uploaded_items"] = list(existing_items_dict.values())
             
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(mapping_data, f, indent=2, ensure_ascii=False)
