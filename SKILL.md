@@ -80,7 +80,7 @@ The agent should map the following user intents to these scripts:
 
 ### 4. Updating Zotero Citation Keys and NotebookLM Source Names
 
-To calculate citation keys, retrieve missing publication dates, write them back to Zotero, and rename matching NotebookLM sources:
+To calculate citation keys, retrieve missing publication dates, write them back to Zotero (via Zotero Web API), and rename matching NotebookLM sources:
 
 ```bash
 python .agents/skills/ma_skill_zotero-to-notebooklm/scripts/update_citation_keys.py \
@@ -88,11 +88,20 @@ python .agents/skills/ma_skill_zotero-to-notebooklm/scripts/update_citation_keys
   --notebook-name "<NOTEBOOK_NAME>"
 ```
 
+#### Configuration & Credentials
+The script uses Zotero's Web API and expects your credentials to be stored in a `.env` file in the root of your workspace:
+* `ZOTERO_LIBRARY_ID`: Your Zotero user ID or group ID (e.g. `6611671`).
+* `ZOTERO_LIBRARY_TYPE`: Either `group` or `user`.
+* `ZOTERO_API_KEY`: Your Zotero API Write-Key.
+
+If these are not present, the script will prompt you to enter them and save them to `.env` automatically.
+
 #### Arguments
-* `--collection-id`: The integer ID of the Zotero collection to update.
-* `--notebook-name`: The title of the notebook in NotebookLM containing the sources to rename.
-* `--zotero-db`: (Optional) Custom path to the `zotero.sqlite` database file.
+* `--collection-id`: The alphanumeric or integer ID of the Zotero collection to update (required).
+* `--notebook-name`: The title of the notebook in NotebookLM containing the sources to rename (required).
 * `--dry-run`: (Optional) Perform calculations and print updates without making changes.
+* `--revert`: (Optional) Roll back the most recent batch of updates applied to Zotero (by loading Zotero data from the local `zotero_changes.json` changelog).
+
 
 ## How it Works
 
@@ -102,8 +111,9 @@ python .agents/skills/ma_skill_zotero-to-notebooklm/scripts/update_citation_keys
 4. Upon successful uploads, it creates or merges the metadata into `zotero_uploaded_items.json` in the current working directory, using the Zotero API identifiers `groupID` and `collection_key` and tags each source in NotebookLM using the Zotero collection name.
 5. The `relink_items.py` script queries the NotebookLM notebook, extracts Zotero keys from the `{author}-{year}-{zotero_key}` formatted titles, matches them back against the Zotero database, and generates the `zotero_uploaded_items.json` matching list.
 6. The `sync_collection.py` script compares local Zotero collection items against `zotero_uploaded_items.json` records, uploads any untransferred items, automatically tags/groups them under the collection name, and updates the JSON registry.
-7. The `update_citation_keys.py` script calculates citation keys, crawls page metadata/sitemaps for missing publication years, writes date and citationKey updates directly to the Zotero SQLite database, and renames matched NotebookLM sources, subsequently running `relink_items.py` to keep the JSON registry synchronized.
-8. All temporary database copies are deleted upon completion.
+7. The `update_citation_keys.py` script calculates citation keys, crawls page metadata/sitemaps for missing publication years, writes date and citationKey updates directly to the Zotero library using the Zotero Web API (with credentials loaded from `.env`), renames matched NotebookLM sources, and subsequently runs `relink_items.py` to keep the JSON registry synchronized.
+8. A changelog of all Zotero updates is stored in `zotero_changes.json` to allow full reversal of applied changes when using `--revert`.
+
 
 ## Converting NotebookLM Deep Research Reports to Pandoc Markdown
 

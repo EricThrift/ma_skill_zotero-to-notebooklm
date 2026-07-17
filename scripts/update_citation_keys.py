@@ -1,7 +1,5 @@
 import subprocess
 import json
-import sqlite3
-import shutil
 import os
 import re
 import sys
@@ -9,16 +7,48 @@ import argparse
 import urllib.request
 import urllib.parse
 import ssl
+from datetime import datetime
+from pyzotero import zotero
 
 # Ignore SSL verification for ease of web access
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 
-def get_default_zotero_paths():
-    home = os.path.expanduser("~")
-    db_path = os.path.join(home, "Zotero", "zotero.sqlite")
-    return db_path
+def load_credentials():
+    env_path = ".env"
+    env_vars = {}
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env_vars[k.strip()] = v.strip()
+                    
+    library_id = os.environ.get("ZOTERO_LIBRARY_ID") or env_vars.get("ZOTERO_LIBRARY_ID")
+    library_type = os.environ.get("ZOTERO_LIBRARY_TYPE") or env_vars.get("ZOTERO_LIBRARY_TYPE")
+    api_key = os.environ.get("ZOTERO_API_KEY") or env_vars.get("ZOTERO_API_KEY")
+    
+    if not library_id or not library_type or not api_key:
+        print("Zotero credentials are required to interact with the Zotero Web API.")
+        if not library_id:
+            library_id = input("Enter Zotero Library ID (e.g. 6611671): ").strip()
+        if not library_type:
+            library_type = input("Enter Zotero Library Type ('group' or 'user'): ").strip().lower()
+            if library_type not in ["group", "user"]:
+                library_type = "group"
+        if not api_key:
+            api_key = input("Enter Zotero API Key: ").strip()
+            
+        # Write to .env
+        with open(env_path, "a" if os.path.exists(env_path) else "w", encoding="utf-8") as f:
+            f.write(f"\nZOTERO_LIBRARY_ID={library_id}\n")
+            f.write(f"ZOTERO_LIBRARY_TYPE={library_type}\n")
+            f.write(f"ZOTERO_API_KEY={api_key}\n")
+        print(f"Credentials saved to {env_path}")
+        
+    return library_id, library_type, api_key
 
 def get_xml(url):
     try:
@@ -40,7 +70,6 @@ def crawl_sitemaps(domain):
         if not content:
             continue
             
-        # If it's a sitemap index, crawl the sub-sitemaps
         sub_sitemaps = re.findall(r'<loc>(http[s]?://[^<]+)</loc>', content)
         if "sitemapindex" in content and sub_sitemaps:
             for sub_url in sub_sitemaps:
@@ -95,7 +124,6 @@ def load_acronyms():
                 return json.load(f)
         except Exception as e:
             print(f"Warning: Failed to load acronyms file: {e}")
-    # Default mappings if file doesn't exist
     default_acros = {
         "museums association of saskatchewan": "MAS",
         "university of saskatchewan art galleries and collection": "USAGC",
@@ -117,10 +145,7 @@ def save_acronyms(acros):
 org_acronyms = load_acronyms()
 
 def generate_acronym(name):
-    # Strip common domain extensions
     clean_name = re.sub(r'\.(?:com|org|net|ca|edu|gov|php)\b', '', name, flags=re.I)
-    
-    # Check if the name contains spaces/hyphens/dots
     words = [w for w in re.split(r'[\s\-.]+', clean_name) if w]
     if len(words) > 1:
         acro_words = []
@@ -134,41 +159,30 @@ def generate_acronym(name):
         if acro_words:
             return "".join(acro_words)
             
-    # Single word - check camelCase
     caps = [c for c in clean_name if c.isupper()]
     if len(caps) >= 2:
         return "".join(caps)
         
     return re.sub(r'[^a-zA-Z0-9]', '', clean_name)[:4].upper()
 
-def resolve_author(item_id, title, url, cursor):
-    cursor.execute("""
-        SELECT c.firstName, c.lastName, c.fieldMode
-        FROM itemCreators ic
-        JOIN creators c ON ic.creatorID = c.creatorID
-        WHERE ic.itemID = ?
-        ORDER BY ic.orderIndex
-    """, (item_id,))
-    creators = cursor.fetchall()
-    
+def resolve_author(item, title, url):
+    creators = item['data'].get('creators', [])
     if creators:
         first_creator = creators[0]
-        first_name, last_name, mode = first_creator
-        if mode == 1:
-            name = last_name or first_name
+        if 'name' in first_creator:
+            name = first_creator['name']
             name_lower = name.lower().strip()
             if name_lower in org_acronyms:
                 return org_acronyms[name_lower]
             
-            # Generate acronym
             acro = generate_acronym(name)
             org_acronyms[name_lower] = acro
             save_acronyms(org_acronyms)
             return acro
         else:
-            return last_name.strip()
+            return first_creator.get('lastName', '').strip()
             
-    title_lower = title.lower()
+    title_lower = title.lower() if title else ""
     if "collectiveaccess" in title_lower:
         return "CA"
     if url and ("saskmuseums.org" in url or "– mas" in title_lower):
@@ -191,59 +205,103 @@ def get_normalized_title(title_str):
         return ""
     return re.sub(r'[^a-zA-Z0-9]', '', title_str).lower()
 
+def revert_last_changes(zot):
+    changelog_file = "zotero_changes.json"
+    if not os.path.exists(changelog_file):
+        print("No Zotero changelog found. Cannot revert.")
+        return
+        
+    try:
+        with open(changelog_file, "r", encoding="utf-8") as f:
+            log_entries = json.load(f)
+    except Exception as e:
+        print(f"Error loading changelog: {e}")
+        return
+        
+    if not log_entries:
+        print("No changes found in Zotero changelog.")
+        return
+        
+    last_batch = log_entries.pop()
+    print(f"Reverting batch from {last_batch['timestamp']}...")
+    
+    reverted_items = []
+    for change in last_batch["items"]:
+        key = change["key"]
+        old_date = change["old_date"]
+        old_cit_key = change["old_cit_key"]
+        
+        print(f"Preparing revert for item {key} ('{change['title'][:40]}')...")
+        try:
+            item = zot.item(key)
+            updated = False
+            if old_date is not None:
+                print(f"  Restoring Date: '{old_date}' (was '{change['new_date']}')")
+                item['data']['date'] = old_date
+                updated = True
+            if old_cit_key is not None:
+                print(f"  Restoring citationKey: '{old_cit_key}' (was '{change['new_cit_key']}')")
+                item['data']['citationKey'] = old_cit_key
+                updated = True
+                
+            if updated:
+                reverted_items.append(item)
+        except Exception as e:
+            print(f"  Failed to retrieve item {key}: {e}")
+            
+    if reverted_items:
+        try:
+            zot.update_items(reverted_items)
+            print(f"\nSuccessfully reverted {len(reverted_items)} items in Zotero library.")
+        except Exception as e:
+            print(f"Failed to update Zotero items: {e}")
+            return
+            
+    with open(changelog_file, "w", encoding="utf-8") as f:
+        json.dump(log_entries, f, indent=2)
+
 def main():
     parser = argparse.ArgumentParser(description="Calculate citation keys, retrieve missing dates, update Zotero database, and rename sources in NotebookLM.")
-    parser.add_argument("--collection-id", type=int, required=True, help="Zotero Collection ID")
-    parser.add_argument("--notebook-name", type=str, required=True, help="NotebookLM Notebook Name")
-    parser.add_argument("--zotero-db", type=str, default=None, help="Path to zotero.sqlite")
+    parser.add_argument("--collection-id", type=str, default=None, help="Zotero Collection ID (required unless reverting)")
+    parser.add_argument("--notebook-name", type=str, default=None, help="NotebookLM Notebook Name (required unless reverting)")
     parser.add_argument("--dry-run", action="store_true", help="Print changes without writing them")
+    parser.add_argument("--revert", action="store_true", help="Revert the most recent Zotero updates batch")
     
     args = parser.parse_args()
     
-    zotero_db = args.zotero_db or get_default_zotero_paths()
-    if not os.path.exists(zotero_db):
-        print(f"Error: Zotero database not found at {zotero_db}")
+    # Load credentials
+    library_id, library_type, api_key = load_credentials()
+    zot = zotero.Zotero(library_id, library_type, api_key)
+    
+    if args.revert:
+        revert_last_changes(zot)
+        sys.exit(0)
+        
+    if not args.collection_id or not args.notebook_name:
+        parser.print_help()
+        print("\nError: --collection-id and --notebook-name are required unless --revert is specified.")
         sys.exit(1)
         
-    temp_db = "zotero_citation_temp.sqlite"
-    shutil.copy2(zotero_db, temp_db)
-    
-    conn = sqlite3.connect(temp_db)
-    cursor = conn.cursor()
-    
-    # Get items in collection
-    cursor.execute("""
-        SELECT i.itemID, i.key, t.typeName
-        FROM collectionItems ci
-        JOIN items i ON ci.itemID = i.itemID
-        JOIN itemTypes t ON i.itemTypeID = t.itemTypeID
-        WHERE ci.collectionID = ?
-    """, (args.collection_id,))
-    zotero_items = cursor.fetchall()
-    
-    if not zotero_items:
-        print(f"No items found in collection ID {args.collection_id}.")
-        conn.close()
-        os.remove(temp_db)
+    print(f"Fetching Zotero items in collection ID {args.collection_id}...")
+    try:
+        zotero_items = zot.collection_items(args.collection_id)
+    except Exception as e:
+        print(f"Error fetching collection items from API: {e}")
         sys.exit(1)
         
-    print(f"Found {len(zotero_items)} items in collection.")
+    # Filter parent items (ignore attachments/notes)
+    parent_items = [item for item in zotero_items if item['data'].get('itemType') not in ['attachment', 'note']]
     
-    def get_field_val(item_id, field_name):
-        cursor.execute("""
-            SELECT v.value
-            FROM itemData id
-            JOIN fields f ON id.fieldID = f.fieldID
-            JOIN itemDataValues v ON id.valueID = v.valueID
-            WHERE id.itemID = ? AND f.fieldName = ?
-        """, (item_id, field_name))
-        row = cursor.fetchone()
-        return row[0] if row else None
-
+    if not parent_items:
+        print(f"No parent items found in collection ID {args.collection_id}.")
+        sys.exit(1)
+        
+    print(f"Found {len(parent_items)} parent items in collection.")
+    
     # Identify domains to crawl sitemaps for
     domains_to_crawl = set()
-    for item_id, key, _ in zotero_items:
-        url = get_field_val(item_id, 'url')
+    for item in parent_items:
+        url = item['data'].get('url')
         if url:
             parsed = urllib.parse.urlparse(url)
             domain = f"{parsed.scheme}://{parsed.netloc}"
@@ -258,10 +316,15 @@ def main():
         
     # Calculate updates
     proposed_updates = []
-    for item_id, key, _ in zotero_items:
-        title = get_field_val(item_id, 'title')
-        url = get_field_val(item_id, 'url')
-        date_val = get_field_val(item_id, 'date')
+    log_items = []
+    items_to_update = []
+    
+    for item in parent_items:
+        key = item['key']
+        title = item['data'].get('title', '')
+        url = item['data'].get('url', '')
+        date_val = item['data'].get('date', '')
+        current_cit_key = item['data'].get('citationKey', '')
         
         # Determine year
         year = None
@@ -284,11 +347,33 @@ def main():
             if not year:
                 year = "ND"
                 
-        author = resolve_author(item_id, title, url, cursor)
+        author = resolve_author(item, title, url)
         cit_key = f"{author}-{year}-{key}"
         
+        date_changed = needs_date_update and (str(year) != str(date_val))
+        key_changed = (cit_key != current_cit_key)
+        
+        if date_changed or key_changed:
+            old_date = date_val if date_changed else None
+            old_cit_key = current_cit_key if key_changed else None
+            
+            log_items.append({
+                "key": key,
+                "title": title,
+                "old_date": old_date,
+                "new_date": year if date_changed else None,
+                "old_cit_key": old_cit_key,
+                "new_cit_key": cit_key if key_changed else None
+            })
+            
+            if date_changed:
+                item['data']['date'] = str(year)
+            if key_changed:
+                item['data']['citationKey'] = cit_key
+                
+            items_to_update.append(item)
+            
         proposed_updates.append({
-            "itemID": item_id,
             "key": key,
             "title": title,
             "url": url,
@@ -296,52 +381,48 @@ def main():
             "new_cit_key": cit_key
         })
         
-    conn.close()
-    os.remove(temp_db)
-    
-    # ----------------------------------------------------
     # Execute Database Writes
-    # ----------------------------------------------------
     if args.dry_run:
         print("\n[DRY RUN] Proposed Updates:")
         for u in proposed_updates:
             print(f"  Item {u['key']}: Date={u['new_date'] or 'Unchanged'}, CitationKey={u['new_cit_key']} ('{u['title'][:40]}')")
     else:
-        # Create Backup
-        backup_db = zotero_db + ".pre_update.bak"
-        print(f"\nBacking up Zotero database to {backup_db}...")
-        shutil.copyfile(zotero_db, backup_db)
-        
-        print("Writing to Zotero database...")
-        conn = sqlite3.connect(zotero_db)
-        cursor = conn.cursor()
-        
-        def set_item_field_write(item_id, field_id, value_str):
-            cursor.execute("INSERT OR IGNORE INTO itemDataValues (value) VALUES (?)", (value_str,))
-            cursor.execute("SELECT valueID FROM itemDataValues WHERE value = ?", (value_str,))
-            value_id = cursor.fetchone()[0]
-            cursor.execute("SELECT valueID FROM itemData WHERE itemID = ? AND fieldID = ?", (item_id, field_id))
-            exist_row = cursor.fetchone()
-            if exist_row:
-                cursor.execute("UPDATE itemData SET valueID = ? WHERE itemID = ? AND fieldID = ?", (value_id, item_id, field_id))
-            else:
-                cursor.execute("INSERT INTO itemData (itemID, fieldID, valueID) VALUES (?, ?, ?)", (item_id, field_id, value_id))
+        if items_to_update:
+            print(f"Updating {len(items_to_update)} items in Zotero via Web API...")
+            try:
+                zot.update_items(items_to_update)
+                print("Zotero Web API update completed successfully.")
+            except Exception as e:
+                print(f"Error updating items in Zotero: {e}")
+                sys.exit(1)
                 
-        for u in proposed_updates:
-            item_id = u["itemID"]
-            if u["new_date"]:
-                set_item_field_write(item_id, 6, str(u["new_date"]))
-            set_item_field_write(item_id, 64, u["new_cit_key"])
+            # Log changes
+            changelog_file = "zotero_changes.json"
+            log_entries = []
+            if os.path.exists(changelog_file):
+                try:
+                    with open(changelog_file, "r", encoding="utf-8") as f:
+                        log_entries = json.load(f)
+                except:
+                    pass
+            log_entries.append({
+                "timestamp": datetime.now().isoformat(),
+                "action": "update_citation_keys",
+                "items": log_items
+            })
+            try:
+                with open(changelog_file, "w", encoding="utf-8") as f:
+                    json.dump(log_entries, f, indent=2)
+                print(f"Log of changes written to {changelog_file}.")
+            except Exception as e:
+                print(f"Warning: Failed to write change log: {e}")
+        else:
+            print("No updates needed in Zotero library.")
             
-        conn.commit()
-        conn.close()
-        print("Zotero database updated successfully.")
-        
     # ----------------------------------------------------
     # NotebookLM Renaming
     # ----------------------------------------------------
     print("\nFetching NotebookLM sources...")
-    # List notebooks
     res_list = subprocess.run(["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "list", "notebooks"], capture_output=True, text=True, encoding="utf-8")
     notebook_id = None
     if res_list.returncode == 0:
