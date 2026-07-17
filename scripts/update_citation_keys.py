@@ -1,3 +1,26 @@
+"""
+update_citation_keys.py
+
+This script processes Zotero items to calculate clean, standardized citation keys (e.g. Author-Year-ItemKey).
+It attempts to locate missing publication dates by scraping page metadata or crawling domain sitemaps,
+writes date and citationKey updates back to Zotero via the Web API, renames matching source documents
+in Google NotebookLM, and updates the local mapping database.
+
+Core Functions:
+- load_credentials: Loads or prompts for Zotero Web API credentials.
+- crawl_sitemaps / parse_sitemap_urls: Crawls domain sitemaps to locate publication years.
+- get_page_meta_date: Scrapes page HTML metadata for publication/creation years.
+- generate_acronym: Builds clean abbreviation keys for organizational creators.
+- resolve_author: Selects a suitable author keyword or acronym for citation keys.
+- revert_last_changes: Restores the previous database state from Zotero changelog logs.
+- main: Coordinates item updates, writes changes to Zotero, renames NotebookLM sources, and rebuilds registry.
+
+When to call:
+- Run this script after syncing references to NotebookLM to assign Zotero citation keys.
+- Run this script if you need to resolve missing dates or clean up citation references.
+- Run with --revert if you need to roll back the last batch of database updates.
+"""
+
 import subprocess
 import json
 import os
@@ -16,6 +39,16 @@ ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 
 def load_credentials():
+    """
+    Loads Zotero credentials from the local .env file or environment variables.
+    If credentials are not found, prompts the user to enter them and saves them to the .env file.
+
+    Inputs:
+        None
+
+    Returns:
+        tuple: A tuple containing (library_id, library_type, api_key) as strings.
+    """
     env_path = ".env"
     env_vars = {}
     if os.path.exists(env_path):
@@ -51,6 +84,15 @@ def load_credentials():
     return library_id, library_type, api_key
 
 def get_xml(url):
+    """
+    Fetches raw text content (typically XML or HTML) from a given URL using a User-Agent header.
+
+    Inputs:
+        url (str): The URL to retrieve content from.
+
+    Returns:
+        str or None: The decoded text content of the page if successful, otherwise None.
+    """
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
@@ -59,6 +101,15 @@ def get_xml(url):
         return None
 
 def crawl_sitemaps(domain):
+    """
+    Crawls common sitemap locations for a domain and extracts page publication/last-modified years.
+
+    Inputs:
+        domain (str): The base domain URL (e.g., 'https://example.com').
+
+    Returns:
+        dict: A mapping of URLs to their last-modified years (4-digit strings).
+    """
     sitemap_dates = {}
     sitemap_urls = [
         f"{domain}/sitemap.xml",
@@ -83,6 +134,16 @@ def crawl_sitemaps(domain):
     return sitemap_dates
 
 def parse_sitemap_urls(xml_content, sitemap_dates):
+    """
+    Parses <url> tags inside an XML sitemap to extract loc and lastmod dates.
+
+    Inputs:
+        xml_content (str): The raw sitemap XML content.
+        sitemap_dates (dict): The dictionary accumulator mapping URL strings to year strings.
+
+    Returns:
+        None (updates sitemap_dates in-place)
+    """
     url_blocks = re.findall(r'<url>.*?</url>', xml_content, re.DOTALL)
     for block in url_blocks:
         loc_match = re.search(r'<loc>(.*?)</loc>', block)
@@ -95,6 +156,15 @@ def parse_sitemap_urls(xml_content, sitemap_dates):
                 sitemap_dates[url_clean] = year_match.group(1)
 
 def get_page_meta_date(url):
+    """
+    Fetches the HTML of a web page and parses meta tags for publication or creation dates.
+
+    Inputs:
+        url (str): The URL of the web page to inspect.
+
+    Returns:
+        str or None: The 4-digit year string if found, otherwise None.
+    """
     if not url:
         return None
     try:
@@ -118,6 +188,15 @@ def get_page_meta_date(url):
 acronyms_file = "org_acronyms.json"
 
 def load_acronyms():
+    """
+    Loads organization acronym mapping rules from the org_acronyms.json file.
+
+    Inputs:
+        None
+
+    Returns:
+        dict: A mapping of lowercased full organization names to their acronyms.
+    """
     if os.path.exists(acronyms_file):
         try:
             with open(acronyms_file, "r", encoding="utf-8") as f:
@@ -136,6 +215,15 @@ def load_acronyms():
     return default_acros
 
 def save_acronyms(acros):
+    """
+    Saves acronym mappings to the org_acronyms.json file.
+
+    Inputs:
+        acros (dict): Acronym mapping dictionary.
+
+    Returns:
+        None
+    """
     try:
         with open(acronyms_file, "w", encoding="utf-8") as f:
             json.dump(acros, f, indent=2)
@@ -145,6 +233,15 @@ def save_acronyms(acros):
 org_acronyms = load_acronyms()
 
 def generate_acronym(name):
+    """
+    Automatically generates a clean uppercase acronym for a given organization name.
+
+    Inputs:
+        name (str): Full organization or author name.
+
+    Returns:
+        str: Generated uppercase acronym string.
+    """
     clean_name = re.sub(r'\.(?:com|org|net|ca|edu|gov|php)\b', '', name, flags=re.I)
     words = [w for w in re.split(r'[\s\-.]+', clean_name) if w]
     if len(words) > 1:
@@ -166,6 +263,17 @@ def generate_acronym(name):
     return re.sub(r'[^a-zA-Z0-9]', '', clean_name)[:4].upper()
 
 def resolve_author(item, title, url):
+    """
+    Resolves a citation-friendly author keyword or organization acronym for a Zotero item.
+
+    Inputs:
+        item (dict): Zotero item data.
+        title (str): Title of the item.
+        url (str): URL of the item.
+
+    Returns:
+        str: Author keyword or acronym to be used in the citation key.
+    """
     creators = item['data'].get('creators', [])
     if creators:
         first_creator = creators[0]
@@ -190,6 +298,15 @@ def resolve_author(item, title, url):
     return "MAS"
 
 def get_url_slug(url_str):
+    """
+    Extracts a clean, lowercase slug from a URL path segment.
+
+    Inputs:
+        url_str (str): The URL string to parse.
+
+    Returns:
+        str: Alphanumeric lowercase slug string.
+    """
     if not url_str:
         return ""
     path = urllib.parse.urlparse(url_str).path
@@ -201,11 +318,29 @@ def get_url_slug(url_str):
     return re.sub(r'[^a-zA-Z0-9]', '', last_seg).lower()
 
 def get_normalized_title(title_str):
+    """
+    Normalizes a title string by keeping only alphanumeric characters in lowercase.
+
+    Inputs:
+        title_str (str): The title string to normalize.
+
+    Returns:
+        str: Normalized lowercase alphanumeric title string.
+    """
     if not title_str:
         return ""
     return re.sub(r'[^a-zA-Z0-9]', '', title_str).lower()
 
 def revert_last_changes(zot):
+    """
+    Reverts the most recent batch of date and citationKey updates applied to Zotero.
+
+    Inputs:
+        zot (zotero.Zotero): The pyzotero client object.
+
+    Returns:
+        None
+    """
     changelog_file = "zotero_changes.json"
     if not os.path.exists(changelog_file):
         print("No Zotero changelog found. Cannot revert.")
@@ -261,6 +396,17 @@ def revert_last_changes(zot):
         json.dump(log_entries, f, indent=2)
 
 def main():
+    """
+    Main logic to load Zotero items, crawl page metadata/sitemaps for dates,
+    assign citation keys, write changes to Zotero, rename sources in NotebookLM,
+    and invoke relink_items.py.
+
+    Inputs:
+        None (uses argparse CLI flags)
+
+    Returns:
+        None
+    """
     parser = argparse.ArgumentParser(description="Calculate citation keys, retrieve missing dates, update Zotero database, and rename sources in NotebookLM.")
     parser.add_argument("--collection-id", type=str, default=None, help="Zotero Collection ID (required unless reverting)")
     parser.add_argument("--notebook-name", type=str, default=None, help="NotebookLM Notebook Name (required unless reverting)")

@@ -1,24 +1,75 @@
+"""
+sync_collection.py
+
+This script synchronizes references from a specified Zotero collection to a Google NotebookLM notebook.
+It fetches items and their PDF attachments via the Zotero Web API, downloads them, uploads them
+to Google NotebookLM using the CLI, automatically labels them under the collection name,
+and updates the local tracking file (zotero_uploaded_items.json).
+
+Core Functions:
+- label_source: Groups/labels uploaded PDF files inside Google NotebookLM.
+- resolve_notebook_id: Fetches the unique Notebook ID based on the notebook name.
+- attempt_resize_pdf: Downsizes PDFs exceeding 25MB via native stream compression or Ghostscript.
+- main: The main synchronization loop checking Web API items and calling upload routines.
+
+When to call:
+- Run this script when doing an initial import of a Zotero collection into a NotebookLM notebook.
+- Run this script on a regular basis (or after adding papers to Zotero) to keep Google NotebookLM up-to-date with new additions.
+"""
+
 import subprocess
 import json
-import sqlite3
-import shutil
 import os
 import re
 import sys
 import argparse
+import urllib.request
+import urllib.parse
+import ssl
+from pyzotero import zotero
 
-def get_default_zotero_paths():
-    home = os.path.expanduser("~")
-    db_path = os.path.join(home, "Zotero", "zotero.sqlite")
-    storage_path = os.path.join(home, "Zotero", "storage")
-    return db_path, storage_path
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+
+# Load credentials from .env
+env_path = r"c:\Users\thrift-e\OneDrive - University of Winnipeg\MUSEUM\PDG\.env"
+env_vars = {}
+if os.path.exists(env_path):
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env_vars[k.strip()] = v.strip()
+
+library_id = env_vars.get("ZOTERO_LIBRARY_ID")
+library_type = env_vars.get("ZOTERO_LIBRARY_TYPE")
+api_key = env_vars.get("ZOTERO_API_KEY")
+
+if not library_id or not api_key:
+    print("Error: Missing Zotero credentials in .env.")
+    sys.exit(1)
+
+zot = zotero.Zotero(library_id, library_type, api_key)
 
 def label_source(notebook_id, source_title, collection_name):
+    """
+    Finds or creates a label in NotebookLM matching the Zotero collection name
+    and assigns the uploaded source to that label.
+
+    Inputs:
+        notebook_id (str): The unique ID of the target NotebookLM notebook.
+        source_title (str): The title of the source document in NotebookLM.
+        collection_name (str): The Zotero collection name used as the label name.
+
+    Returns:
+        bool: True if labeling was successful, False otherwise.
+    """
     # 1. Get or create label ID
     print(f"Finding or creating label for collection '{collection_name}'...")
     label_id = None
     
-    # List labels
     cmd_list_labels = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "label", "list", notebook_id, "--json"]
     res_list = subprocess.run(cmd_list_labels, capture_output=True, text=True, encoding="utf-8")
     if res_list.returncode == 0:
@@ -37,7 +88,6 @@ def label_source(notebook_id, source_title, collection_name):
         cmd_create_label = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "label", "create", notebook_id, collection_name]
         subprocess.run(cmd_create_label, capture_output=True, text=True, encoding="utf-8")
         
-        # List labels again to get the ID
         res_list = subprocess.run(cmd_list_labels, capture_output=True, text=True, encoding="utf-8")
         if res_list.returncode == 0:
             try:
@@ -85,6 +135,15 @@ def label_source(notebook_id, source_title, collection_name):
         return False
 
 def resolve_notebook_id(notebook_name):
+    """
+    Retrieves the unique Google NotebookLM notebook ID for a given notebook title.
+
+    Inputs:
+        notebook_name (str): The name/title of the target NotebookLM notebook.
+
+    Returns:
+        str or None: The notebook ID string if found, otherwise None.
+    """
     # Find notebook ID by title
     cmd_list = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "list", "notebooks"]
     res_list = subprocess.run(cmd_list, capture_output=True, text=True, encoding="utf-8")
@@ -99,7 +158,17 @@ def resolve_notebook_id(notebook_name):
     return None
 
 def attempt_resize_pdf(input_path, output_path):
-    # Attempt 1: Native pypdf compression if installed
+    """
+    Attempts to compress/resize a PDF file to fit within Google's 25MB file size limit.
+    Tries native pypdf stream compression first, falling back to Ghostscript CLI if available.
+
+    Inputs:
+        input_path (str): The path to the source PDF file.
+        output_path (str): The path where the compressed PDF should be written.
+
+    Returns:
+        bool: True if compression was successful and the output file is < 25MB, False otherwise.
+    """
     try:
         from pypdf import PdfReader, PdfWriter
         reader = PdfReader(input_path)
@@ -115,7 +184,6 @@ def attempt_resize_pdf(input_path, output_path):
     except Exception as e:
         print(f"pypdf compression attempt failed/skipped: {e}")
         
-    # Attempt 2: Ghostscript CLI if available
     try:
         cmd = [
             "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
@@ -131,43 +199,24 @@ def attempt_resize_pdf(input_path, output_path):
         pass
     return False
 
-def get_zotero_text(att_folder):
-    cache_path = os.path.join(att_folder, ".zotero-ft-cache")
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                return f.read(), ".zotero-ft-cache"
-        except Exception as e:
-            print(f"Error reading Zotero cache {cache_path}: {e}")
-            
-    unproc_path = os.path.join(att_folder, ".zotero-ft-unprocessed")
-    if os.path.exists(unproc_path):
-        try:
-            with open(unproc_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict) and "text" in data:
-                    return data["text"], ".zotero-ft-unprocessed"
-        except Exception as e:
-            print(f"Error reading Zotero unprocessed {unproc_path}: {e}")
-            
-    return None, None
-
 def main():
-    parser = argparse.ArgumentParser(description="Synchronize collections from Zotero to NotebookLM")
+    """
+    Main execution logic to connect to Zotero via Web API, fetch items,
+    retrieve PDF attachments, upload them to NotebookLM, and update mapping database.
+
+    Inputs:
+        None (uses argparse CLI flags)
+
+    Returns:
+        None
+    """
+    parser = argparse.ArgumentParser(description="Synchronize collections from Zotero to NotebookLM using the Web API")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--all", action="store_true", help="Sync all previously uploaded collections")
     group.add_argument("--collection-name", type=str, help="Sync a specific collection by its Zotero name")
     group.add_argument("--list", action="store_true", help="List currently synchronized collections")
     
-    parser.add_argument("--zotero-db", type=str, default=None, help="Path to zotero.sqlite")
-    parser.add_argument("--zotero-storage", type=str, default=None, help="Path to Zotero storage directory")
-    
     args = parser.parse_args()
-    
-    default_db, default_storage = get_default_zotero_paths()
-    zotero_db = args.zotero_db or default_db
-    zotero_storage = args.zotero_storage or default_storage
-    
     output_file = "zotero_uploaded_items.json"
     
     # 1. Handle Listing
@@ -185,12 +234,7 @@ def main():
             for col in lib.get("collections", []):
                 print(f"  - Collection: {col.get('name')} (key: {col.get('collection_key')}) - {len(col.get('uploaded_items', []))} items")
         return
- 
-    # Check Zotero DB existence
-    if not os.path.exists(zotero_db):
-        print(f"Error: Zotero database not found at {zotero_db}")
-        sys.exit(1)
-        
+
     # Check NotebookLM CLI auth
     print("Checking NotebookLM connection...")
     res_info = subprocess.run(["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "doctor"], capture_output=True, text=True, encoding="utf-8")
@@ -203,7 +247,7 @@ def main():
     mapping_data = {
         "target_notebook": {
             "notebook_id": "PLACEHOLDER_NOTEBOOK_ID",
-            "name": "Museum Catalogues"
+            "name": "Restorative cataloguing"
         },
         "source_libraries": []
     }
@@ -214,8 +258,7 @@ def main():
         except Exception as e:
             print(f"Warning: Could not read {output_file}: {e}")
 
-    # Resolve Notebook ID if placeholder or missing
-    notebook_name = mapping_data["target_notebook"].get("name", "Museum Catalogues")
+    notebook_name = mapping_data["target_notebook"].get("name", "Restorative cataloguing")
     notebook_id = mapping_data["target_notebook"].get("notebook_id")
     if not notebook_id or notebook_id == "PLACEHOLDER_NOTEBOOK_ID":
         print(f"Resolving Notebook ID for '{notebook_name}'...")
@@ -224,108 +267,77 @@ def main():
             print(f"Error: Could not find or resolve NotebookLM notebook named '{notebook_name}'.")
             sys.exit(1)
         mapping_data["target_notebook"]["notebook_id"] = notebook_id
-        # Save resolved ID immediately
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(mapping_data, f, indent=2, ensure_ascii=False)
 
     print(f"Target Notebook ID: {notebook_id}")
 
-    # 2. Open SQLite temp copy
-    temp_db = "zotero_sync_temp.sqlite"
-    shutil.copy2(zotero_db, temp_db)
-    conn = sqlite3.connect(temp_db)
-    cursor = conn.cursor()
+    # Fetch all collections via Web API to find the key
+    print("Fetching Zotero collections list...")
+    collections = []
+    start = 0
+    limit = 100
+    while True:
+        chunk = zot.collections(limit=limit, start=start)
+        if not chunk:
+            break
+        collections.extend(chunk)
+        if len(chunk) < limit:
+            break
+        start += limit
 
     collections_to_sync = []
     
-    # 3. Determine which collections to sync
     if args.collection_name:
-        # Search collection by name in Zotero DB
-        cursor.execute("""
-            SELECT collections.collectionID, groups.groupID, groups.name, collections.key, collections.collectionName
-            FROM collections
-            JOIN groups ON collections.libraryID = groups.libraryID
-            WHERE collections.collectionName = ?
-        """, (args.collection_name,))
-        row = cursor.fetchone()
-        if not row:
-            # Personal library fallback
-            cursor.execute("SELECT collectionID, key, collectionName FROM collections WHERE collectionName = ?", (args.collection_name,))
-            p_row = cursor.fetchone()
-            if p_row:
-                col_id, col_key, col_name = p_row
-                group_id = 0
-                group_name = "My Library"
-            else:
-                print(f"Error: Collection '{args.collection_name}' not found in Zotero database.")
-                conn.close()
-                os.remove(temp_db)
-                sys.exit(1)
-        else:
-            col_id, group_id, group_name, col_key, col_name = row
+        matched_col = None
+        for col in collections:
+            if col["data"]["name"] == args.collection_name:
+                matched_col = col
+                break
+        if not matched_col:
+            print(f"Error: Collection '{args.collection_name}' not found in Zotero library.")
+            sys.exit(1)
             
         collections_to_sync.append({
-            "collection_id": col_id,
-            "collection_key": col_key,
-            "collection_name": col_name,
-            "groupID": group_id,
-            "group_name": group_name
+            "collection_key": matched_col["key"],
+            "collection_name": matched_col["data"]["name"],
+            "groupID": int(library_id) if library_type == "group" else 0,
+            "group_name": "Group Library" if library_type == "group" else "My Library"
         })
     else:  # --all
-        # Get collection keys from mapping file
-        mapped_collections = []
+        mapped_collection_keys = []
         for lib in mapping_data.get("source_libraries", []):
             for col in lib.get("collections", []):
-                mapped_collections.append((col.get("collection_key"), lib.get("groupID")))
+                mapped_collection_keys.append(col.get("collection_key"))
                 
-        if not mapped_collections:
+        if not mapped_collection_keys:
             print("No collections registered in zotero_uploaded_items.json to sync.")
-            conn.close()
-            os.remove(temp_db)
             return
             
-        for col_key, group_id in mapped_collections:
-            cursor.execute("""
-                SELECT collections.collectionID, collections.collectionName, groups.name
-                FROM collections
-                JOIN groups ON collections.libraryID = groups.libraryID
-                WHERE collections.key = ? AND groups.groupID = ?
-            """, (col_key, group_id))
-            row = cursor.fetchone()
-            if row:
-                col_id, col_name, group_name = row
+        for col_key in mapped_collection_keys:
+            matched_col = None
+            for col in collections:
+                if col["key"] == col_key:
+                    matched_col = col
+                    break
+            if matched_col:
                 collections_to_sync.append({
-                    "collection_id": col_id,
                     "collection_key": col_key,
-                    "collection_name": col_name,
-                    "groupID": group_id,
-                    "group_name": group_name
+                    "collection_name": matched_col["data"]["name"],
+                    "groupID": int(library_id) if library_type == "group" else 0,
+                    "group_name": "Group Library" if library_type == "group" else "My Library"
                 })
-            else:
-                # Personal library fallback
-                cursor.execute("SELECT collectionID, collectionName FROM collections WHERE key = ?", (col_key,))
-                p_row = cursor.fetchone()
-                if p_row:
-                    col_id, col_name = p_row
-                    collections_to_sync.append({
-                        "collection_id": col_id,
-                        "collection_key": col_key,
-                        "collection_name": col_name,
-                        "groupID": 0,
-                        "group_name": "My Library"
-                    })
 
     all_failed_items = []
 
     # 4. Sync each collection
     for col_info in collections_to_sync:
-        col_id = col_info["collection_id"]
         col_key = col_info["collection_key"]
         col_name = col_info["collection_name"]
         group_id = col_info["groupID"]
         group_name = col_info["group_name"]
         
-        print(f"\nSyncing collection '{col_name}' ({col_key}) from group '{group_name}'...")
+        print(f"\nSyncing collection '{col_name}' ({col_key})...")
         
         # Get existing keys in mapping
         existing_keys = set()
@@ -343,43 +355,39 @@ def main():
             if col_entry:
                 existing_keys = {item["zotero_key"] for item in col_entry.get("uploaded_items", [])}
 
-        # Query all items in this collection from Zotero
-        cursor.execute("""
-            SELECT items.itemID, items.key, itemTypes.typeName
-            FROM collectionItems
-            JOIN items ON collectionItems.itemID = items.itemID
-            JOIN itemTypes ON items.itemTypeID = itemTypes.itemTypeID
-            WHERE collectionItems.collectionID = ?
-              AND itemTypes.typeName NOT IN ('attachment', 'note')
-        """, (col_id,))
-        parent_items = cursor.fetchall()
+        # Query all items in this collection via Web API
+        print("Fetching collection items...")
+        all_items = []
+        start = 0
+        limit = 100
+        while True:
+            chunk = zot.collection_items(col_key, limit=limit, start=start)
+            if not chunk:
+                break
+            all_items.extend(chunk)
+            if len(chunk) < limit:
+                break
+            start += limit
+
+        parent_items = [item for item in all_items if item["data"].get("itemType") not in ["attachment", "note"]]
         
         to_upload = []
-        for parent_id, parent_key, type_name in parent_items:
+        for item in parent_items:
+            parent_key = item["key"]
             if parent_key in existing_keys:
-                continue # Already synchronized
+                continue
                 
-            # Title
-            cursor.execute("""
-                SELECT itemDataValues.value
-                FROM itemData
-                JOIN fields ON itemData.fieldID = fields.fieldID
-                JOIN itemDataValues ON itemData.valueID = itemDataValues.valueID
-                WHERE itemData.itemID = ? AND fields.fieldName = 'title'
-            """, (parent_id,))
-            title_row = cursor.fetchone()
-            title = title_row[0] if title_row else ""
-
+            title = item["data"].get("title", "")
+            date = item["data"].get("date", "")
+            
+            # Author
+            creators = item["data"].get("creators", [])
+            author = "Unknown"
+            if creators:
+                first_creator = creators[0]
+                author = first_creator.get("lastName") or first_creator.get("name") or "Unknown"
+                
             # Year
-            cursor.execute("""
-                SELECT itemDataValues.value
-                FROM itemData
-                JOIN fields ON itemData.fieldID = fields.fieldID
-                JOIN itemDataValues ON itemData.valueID = itemDataValues.valueID
-                WHERE itemData.itemID = ? AND fields.fieldName = 'date'
-            """, (parent_id,))
-            date_row = cursor.fetchone()
-            date = date_row[0] if date_row else ""
             year = "Unknown"
             if date:
                 m = re.search(r'\b(19|20)\d{2}\b', date)
@@ -387,37 +395,30 @@ def main():
                     year = m.group(0)
                 else:
                     year = date[:4]
-
-            # Author
-            cursor.execute("""
-                SELECT creators.lastName
-                FROM itemCreators
-                JOIN creators ON itemCreators.creatorID = creators.creatorID
-                WHERE itemCreators.itemID = ?
-                ORDER BY itemCreators.orderIndex
-                LIMIT 1
-            """, (parent_id,))
-            author_row = cursor.fetchone()
-            author = author_row[0] if author_row else "Unknown"
-
-            # Attachment path
-            cursor.execute("""
-                SELECT items.key, itemAttachments.path
-                FROM items
-                JOIN itemAttachments ON items.itemID = itemAttachments.itemID
-                WHERE itemAttachments.parentItemID = ? AND itemAttachments.contentType = 'application/pdf'
-            """, (parent_id,))
-            attachments = cursor.fetchall()
+                    
+            type_name = item["data"].get("itemType", "document")
             
-            for att_key, att_path in attachments:
-                filename = att_path
-                if att_path and att_path.startswith("storage:"):
-                    filename = att_path[8:]
-                
-                local_path = os.path.join(zotero_storage, att_key, filename)
-                if os.path.exists(local_path):
-                    target_title = f"{author}-{year}-{parent_key}"
-                    to_upload.append((local_path, target_title, parent_key, author, date, type_name, title))
+            # Query child attachments via Web API
+            children = zot.children(parent_key)
+            attachments = []
+            for child in children:
+                c_data = child["data"]
+                if c_data.get("itemType") == "attachment" and c_data.get("contentType") == "application/pdf":
+                    attachments.append(child)
+                    
+            for att in attachments:
+                att_key = att["key"]
+                filename = att["data"].get("filename") or f"{parent_key}_attachment.pdf"
+                to_upload.append({
+                    "attachment_key": att_key,
+                    "filename": filename,
+                    "parent_key": parent_key,
+                    "author": author,
+                    "year": year,
+                    "date": date,
+                    "type_name": type_name,
+                    "title": title
+                })
 
         if not to_upload:
             print(f"Collection '{col_name}' is already up-to-date.")
@@ -427,89 +428,89 @@ def main():
         uploaded_count = 0
         uploaded_metadata = []
         
-        for file_path, target_title, parent_key, author, date, type_name, title in to_upload:
-            print(f"[{uploaded_count+len(all_failed_items)+1}/{len(to_upload)}] Processing '{target_title}'...")
+        for task in to_upload:
+            att_key = task["attachment_key"]
+            filename = task["filename"]
+            parent_key = task["parent_key"]
+            author = task["author"]
+            year = task["year"]
+            date = task["date"]
+            type_name = task["type_name"]
+            title = task["title"]
             
-            file_size = os.path.getsize(file_path)
-            upload_path = file_path
-            temp_txt_path = None
+            target_title = f"{author}-{year}-{parent_key}"
+            print(f"[{uploaded_count+len(all_failed_items)+1}/{len(to_upload)}] Downloading attachment '{filename}' from Zotero...")
             
-            # Check size constraints
-            if file_size > 25 * 1024 * 1024:
-                print(f"Source file is too large: {file_size / (1024*1024):.1f}MB (limit: 25MB)")
+            local_path = filename
+            try:
+                # Download using pyzotero's dump method
+                zot.dump(att_key, local_path)
                 
-                resized_path = file_path + ".resized.pdf"
-                print("Attempting to resize PDF to fit size limit...")
-                if attempt_resize_pdf(file_path, resized_path):
-                    print("Successfully resized PDF!")
-                    upload_path = resized_path
-                else:
-                    print("Could not resize PDF. Attempting to retrieve full-text content from Zotero storage...")
-                    att_folder = os.path.dirname(file_path)
-                    extracted_text, source_file = get_zotero_text(att_folder)
-                    if extracted_text:
-                        print(f"Found Zotero extracted text in {source_file}!")
-                        temp_txt_path = os.path.join(os.path.dirname(output_file) or ".", f"{target_title}.txt")
-                        try:
-                            with open(temp_txt_path, "w", encoding="utf-8") as f:
-                                f.write(extracted_text)
-                            upload_path = temp_txt_path
-                        except Exception as e:
-                            print(f"Error writing temporary text file: {e}")
-                            upload_path = None
+                file_size = os.path.getsize(local_path)
+                upload_path = local_path
+                
+                # Check size constraints
+                if file_size > 25 * 1024 * 1024:
+                    print(f"Downloaded PDF is too large: {file_size / (1024*1024):.1f}MB (limit: 25MB). Resizing...")
+                    resized_path = local_path + ".resized.pdf"
+                    if attempt_resize_pdf(local_path, resized_path):
+                        upload_path = resized_path
                     else:
-                        print("Warning: No extracted full-text content found in Zotero storage directory.")
+                        print("Warning: Could not resize PDF to fit 25MB constraint.")
                         upload_path = None
                         
-            if not upload_path:
-                print(f"Error: PDF is too large and text content could not be retrieved. Skipping {target_title}.")
-                all_failed_items.append(f"{target_title} (File too large, failed to resize/extract text)")
-                continue
-
-            print(f"Uploading '{target_title}' to NotebookLM...")
-            cmd_upload = [
-                "uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "source", "add",
-                notebook_id,
-                "--file", upload_path,
-                "--title", target_title,
-                "--wait"
-            ]
-            res_upload = subprocess.run(cmd_upload, capture_output=True, text=True, encoding="utf-8")
-            
-            # Clean up temp files
-            if temp_txt_path and os.path.exists(temp_txt_path):
-                try:
-                    os.remove(temp_txt_path)
-                except Exception:
-                    pass
-            resized_temp = file_path + ".resized.pdf"
-            if os.path.exists(resized_temp):
-                try:
+                if not upload_path:
+                    print(f"Error: PDF is too large. Skipping {target_title}.")
+                    all_failed_items.append(f"{target_title} (PDF exceeds size limit)")
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                    continue
+                    
+                print(f"Uploading '{target_title}' to NotebookLM...")
+                cmd_upload = [
+                    "uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "source", "add",
+                    notebook_id,
+                    "--file", upload_path,
+                    "--title", target_title,
+                    "--wait"
+                ]
+                res_upload = subprocess.run(cmd_upload, capture_output=True, text=True, encoding="utf-8")
+                
+                # Clean up local files
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                resized_temp = local_path + ".resized.pdf"
+                if os.path.exists(resized_temp):
                     os.remove(resized_temp)
-                except Exception:
-                    pass
+                    
+                if res_upload.returncode == 0:
+                    print(f"Successfully uploaded: {target_title}")
+                    label_source(notebook_id, target_title, col_name)
+                    
+                    uploaded_count += 1
+                    uploaded_metadata.append({
+                        "author": author,
+                        "date": date,
+                        "zotero_key": parent_key,
+                        "title": title,
+                        "itemtype": type_name
+                    })
+                else:
+                    print(f"Failed to upload {target_title}:")
+                    print(res_upload.stderr)
+                    all_failed_items.append(f"{target_title} (NotebookLM upload command failed)")
+                    
+            except Exception as e:
+                print(f"Error processing attachment {filename}: {e}")
+                if os.path.exists(local_path):
+                    try:
+                        os.remove(local_path)
+                    except:
+                        pass
+                all_failed_items.append(f"{target_title} (Download/process error)")
 
-            if res_upload.returncode == 0:
-                print(f"Successfully uploaded: {target_title}")
-                # Assign to collection label
-                label_source(notebook_id, target_title, col_name)
-                
-                uploaded_count += 1
-                uploaded_metadata.append({
-                    "author": author,
-                    "date": date,
-                    "zotero_key": parent_key,
-                    "title": title,
-                    "itemtype": type_name
-                })
-            else:
-                print(f"Failed to upload {target_title}:")
-                print(res_upload.stderr)
-                all_failed_items.append(f"{target_title} (NotebookLM upload command failed: {res_upload.stderr.strip()})")
-                
         # Merge results into mapping_data
         if uploaded_metadata:
-            # Find/create group entry
             lib_entry = None
             for lib in mapping_data.get("source_libraries", []):
                 if lib.get("groupID") == group_id:
@@ -518,12 +519,11 @@ def main():
             if not lib_entry:
                 lib_entry = {
                     "groupID": group_id,
-                    "name": group_name,
+                    "name": col_info["group_name"],
                     "collections": []
                 }
                 mapping_data["source_libraries"].append(lib_entry)
                 
-            # Find/create collection entry
             col_entry = None
             for col in lib_entry.get("collections", []):
                 if col.get("collection_key") == col_key:
@@ -546,8 +546,6 @@ def main():
                 json.dump(mapping_data, f, indent=2, ensure_ascii=False)
             print(f"Recorded metadata for {len(uploaded_metadata)} new items in {output_file}")
 
-    conn.close()
-    os.remove(temp_db)
     print("\nSynchronization complete.")
     
     if all_failed_items:
