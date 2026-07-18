@@ -27,6 +27,17 @@ This skill does NOT support synchronization of items *from* NotebookLM *to* Zote
 
 ## Usage
 
+### 0. Creating a NotebookLM Notebook (Manual & Automatic)
+
+- **Automatic Creation**:
+  When synchronizing a collection, the `sync_collection.py` script automatically checks if a Google NotebookLM notebook with the same name exists. If it is not found, it automatically creates it using the CLI and retrieves its ID before proceeding with downloads and uploads.
+
+- **Manual Creation via CLI**:
+  To manually create a new NotebookLM notebook:
+  ```bash
+  uvx --link-mode=copy --from notebooklm-mcp-cli nlm notebook create "<NOTEBOOK_NAME>"
+  ```
+
 ### 1. Synchronizing a Zotero Collection (Initial & Incremental)
 
 You can sync items from your Zotero collections to Google NotebookLM by running the sync script:
