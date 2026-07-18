@@ -33,7 +33,7 @@ ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 
 # Load credentials from .env
-env_path = r"c:\Users\thrift-e\OneDrive - University of Winnipeg\MUSEUM\PDG\.env"
+env_path = ".env"
 env_vars = {}
 if os.path.exists(env_path):
     with open(env_path, "r", encoding="utf-8") as f:
@@ -282,7 +282,21 @@ def main():
     print(f"Resolving Notebook ID for '{notebook_name}'...")
     notebook_id = resolve_notebook_id(notebook_name)
     if not notebook_id:
-        print(f"Error: Could not find or resolve NotebookLM notebook named '{notebook_name}'.")
+        print(f"Notebook '{notebook_name}' not found. Attempting to create it in NotebookLM...")
+        cmd_create = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "notebook", "create", notebook_name, "--json"]
+        res_create = subprocess.run(cmd_create, capture_output=True, text=True, encoding="utf-8")
+        if res_create.returncode == 0:
+            try:
+                created_data = json.loads(res_create.stdout)
+                notebook_id = created_data.get("notebook_id")
+                print(f"Successfully created notebook '{notebook_name}' with ID: {notebook_id}")
+            except Exception as e:
+                print(f"Error parsing notebook creation output: {e}")
+        else:
+            print(f"Error creating notebook '{notebook_name}': {res_create.stderr}")
+            
+    if not notebook_id:
+        print(f"Error: Could not find, create or resolve NotebookLM notebook named '{notebook_name}'.")
         sys.exit(1)
 
     print(f"Target Notebook ID: {notebook_id}")
