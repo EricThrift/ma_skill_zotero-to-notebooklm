@@ -24,6 +24,8 @@ This skill does NOT support synchronization of items *from* NotebookLM *to* Zote
      python -m venv .venv
      .venv\Scripts\pip install pyzotero pypdf
      ```
+4. **Microsoft Edge**:
+   - Microsoft Edge must be installed on the system (usually at `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe` or `C:\Program Files\Microsoft\Edge\Application\msedge.exe`) to perform headless HTML snapshot conversions to PDF.
 
 ## Usage
 
@@ -95,7 +97,7 @@ python .agents/skills/ma_skill_zotero-to-notebooklm/scripts/update_citation_keys
 1. The integration connects to Zotero via the HTTP Web API (using `pyzotero` with credentials loaded from `.env`).
 2. The `sync_collection.py` script queries all items in a specified Zotero collection via the Web API.
 3. For items not yet present in `zotero_uploaded_items.json`, it queries child attachments via Zotero Web API.
-4. For each PDF attachment found, the script downloads the file locally using Zotero's attachment dump API, uploads it to NotebookLM using `nlm source add` with a standardized title format (`{author}-{year}-{zotero_key}`), assigns it to a collection label, and immediately deletes the temporary local download.
+4. For each PDF or HTML snapshot attachment found, the script downloads the file locally using Zotero's attachment dump API. If the attachment is an HTML snapshot, it uses Microsoft Edge in headless mode to convert the HTML file to a print-ready PDF. The script then uploads the resulting PDF to NotebookLM using `nlm source add` with a standardized title format (`{author}-{year}-{zotero_key}`), assigns it to a collection label, and immediately deletes all temporary local files.
 5. Upon successful uploads, the script saves or merges the metadata into `zotero_uploaded_items.json` in the workspace root directory.
 6. The `relink_items.py` script queries the NotebookLM notebook, extracts Zotero keys from formatted source titles, fetches the items from the Zotero Web API, and reconstructs the `zotero_uploaded_items.json` matching database.
 7. The `update_citation_keys.py` script calculates citation keys, crawls page metadata/sitemaps for missing publication years, writes date and citationKey updates directly to the Zotero library using the Zotero Web API (with credentials loaded from `.env`), renames matched NotebookLM sources, and subsequently runs `relink_items.py` to keep the JSON registry synchronized.
