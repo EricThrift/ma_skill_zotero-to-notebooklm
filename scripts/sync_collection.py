@@ -46,6 +46,71 @@ if not library_id or not api_key:
 
 zot = zotero.Zotero(library_id, library_type, api_key)
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+try:
+    from update_citation_keys import resolve_author, org_acronyms, save_acronyms, generate_acronym
+except Exception:
+    resolve_author = None
+
+def get_zotero_citation_key(zot_client, item):
+    """
+    Resolves or calculates the Zotero citationKey for a parent item.
+    1. Checks item['data'].get('citationKey')
+    2. Parses item['data'].get('extra') for 'Citation Key: ...'
+    3. Derives author, year, key and generates author-year-key
+    4. Updates Zotero if citationKey was missing.
+    """
+    data = item.get("data", {})
+    key = item.get("key", "")
+    cit_key = data.get("citationKey")
+    if cit_key and cit_key.strip():
+        return cit_key.strip()
+
+    extra = data.get("extra", "")
+    if extra:
+        m = re.search(r'(?:citation\s*key|citation-key):\s*([^\s\n]+)', extra, re.I)
+        if m:
+            return m.group(1).strip()
+
+    title = data.get("title", "")
+    url = data.get("url", "")
+    date = data.get("date", "")
+
+    year = "ND"
+    if date:
+        m = re.search(r'\b(19|20)\d{2}\b', date)
+        if m:
+            year = m.group(0)
+        else:
+            year = date[:4]
+
+    if resolve_author:
+        try:
+            author = resolve_author(item, title, url)
+        except Exception:
+            creators = data.get("creators", [])
+            author = "Unknown"
+            if creators:
+                first_creator = creators[0]
+                author = first_creator.get("lastName") or first_creator.get("name") or "Unknown"
+    else:
+        creators = data.get("creators", [])
+        author = "Unknown"
+        if creators:
+            first_creator = creators[0]
+            author = first_creator.get("lastName") or first_creator.get("name") or "Unknown"
+
+    cit_key = f"{author}-{year}-{key}"
+
+    try:
+        item["data"]["citationKey"] = cit_key
+        zot_client.update_items([item])
+        print(f"Assigned and saved citationKey '{cit_key}' to Zotero item {key}")
+    except Exception as e:
+        print(f"Note: Could not write citationKey to Zotero for {key}: {e}")
+
+    return cit_key
+
 def label_source(notebook_id, source_title, collection_name):
     """
     Finds or creates a label in NotebookLM matching the Zotero collection/subcollection name
@@ -316,6 +381,24 @@ def main():
         
         existing_keys = {item["zotero_key"] for item in mapping_data.get("uploaded_items", [])}
 
+        print("Fetching existing NotebookLM sources for duplicate prevention...")
+        cmd_list_sources = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "list", "sources", notebook_id, "--json"]
+        nlm_titles = set()
+        nlm_key_map = {}
+        res_sources = subprocess.run(cmd_list_sources, capture_output=True, text=True, encoding="utf-8")
+        if res_sources.returncode == 0:
+            try:
+                sources_list = json.loads(res_sources.stdout)
+                for src in sources_list:
+                    s_title = src.get("title", "")
+                    if s_title:
+                        nlm_titles.add(s_title)
+                        m = re.search(r'([A-Z0-9]{8})$', s_title)
+                        if m:
+                            nlm_key_map[m.group(1)] = s_title
+            except Exception as e:
+                print(f"Warning: Could not parse NotebookLM sources list: {e}")
+
         # Resolve subcollections of col_key
         subcols = [col for col in collections if col["data"].get("parentCollection") == col_key]
         print(f"Found {len(subcols)} subcollections of '{col_name}'")
@@ -351,7 +434,6 @@ def main():
                 start += limit
                 
         parent_items = list(item_details.values())
-        to_upload = []
         uploaded_metadata = []
         uploaded_count = 0
         
@@ -360,32 +442,33 @@ def main():
             parent_key = item["key"]
             title = item["data"].get("title", "")
             date = item["data"].get("date", "")
-            
-            creators = item["data"].get("creators", [])
-            author = "Unknown"
-            if creators:
-                first_creator = creators[0]
-                author = first_creator.get("lastName") or first_creator.get("name") or "Unknown"
-                
-            year = "Unknown"
-            if date:
-                m = re.search(r'\b(19|20)\d{2}\b', date)
-                if m:
-                    year = m.group(0)
-                else:
-                    year = date[:4]
-                    
             type_name = item["data"].get("itemType", "document")
-            target_title = f"{author}-{year}-{parent_key}"
-            is_already_uploaded = parent_key in existing_keys
+            
+            cit_key = get_zotero_citation_key(zot, item)
+            target_title = cit_key
+            
+            is_in_mapping = parent_key in existing_keys
+            is_in_nlm = (target_title in nlm_titles) or (parent_key in nlm_key_map)
+            matched_nlm_title = target_title if target_title in nlm_titles else nlm_key_map.get(parent_key, target_title)
+            
+            is_already_uploaded = is_in_mapping or is_in_nlm
             
             if is_already_uploaded:
-                print(f"[{idx}/{len(parent_items)}] '{target_title}' already exists. Verifying/adding labels...")
+                print(f"[{idx}/{len(parent_items)}] '{matched_nlm_title}' (Key: {parent_key}) already uploaded. Verifying/adding labels...")
                 labels_to_apply = item_subcollections.get(parent_key, set())
                 if not labels_to_apply:
                     labels_to_apply = {col_name}
                 for label in labels_to_apply:
-                    label_source(notebook_id, target_title, label)
+                    label_source(notebook_id, matched_nlm_title, label)
+                if parent_key not in existing_keys:
+                    uploaded_metadata.append({
+                        "author": cit_key.split("-")[0] if "-" in cit_key else "Unknown",
+                        "date": date,
+                        "zotero_key": parent_key,
+                        "title": title,
+                        "itemtype": type_name
+                    })
+                    existing_keys.add(parent_key)
             else:
                 children = zot.children(parent_key)
                 attachments = []
@@ -398,13 +481,10 @@ def main():
                     att = attachments[0]
                     att_key = att["key"]
                     content_type = att["data"].get("contentType")
-                    filename = att["data"].get("filename") or f"{parent_key}_attachment"
-                    if content_type == "text/html" and not filename.endswith(".html"):
-                        filename += ".html"
-                    elif content_type == "application/pdf" and not filename.endswith(".pdf"):
-                        filename += ".pdf"
-                        
-                    print(f"[{idx}/{len(parent_items)}] Downloading attachment '{filename}'...")
+                    ext = ".html" if content_type == "text/html" else ".pdf"
+                    filename = f"{cit_key}{ext}"
+                    
+                    print(f"[{idx}/{len(parent_items)}] Downloading attachment '{filename}' for '{target_title}'...")
                     current_dir = os.path.abspath(os.getcwd())
                     local_path = os.path.join(current_dir, filename)
                     upload_path = None
@@ -414,8 +494,7 @@ def main():
                         is_html = content_type == "text/html"
                         
                         if is_html:
-                            pdf_filename = filename.replace(".html", ".pdf") if filename.endswith(".html") else filename + ".pdf"
-                            pdf_path = os.path.join(current_dir, pdf_filename)
+                            pdf_path = os.path.join(current_dir, f"{cit_key}.pdf")
                             if convert_html_to_pdf(local_path, pdf_path):
                                 upload_path = pdf_path
                             else:
@@ -440,7 +519,7 @@ def main():
                                 os.remove(local_path)
                             continue
                             
-                        print(f"Uploading '{target_title}' (converted from {content_type}) to NotebookLM...")
+                        print(f"Uploading '{target_title}' directly using Zotero Citation Key to NotebookLM...")
                         cmd_upload = [
                             "uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "source", "add",
                             notebook_id,
@@ -461,6 +540,9 @@ def main():
                             
                         if res_upload.returncode == 0:
                             print(f"Successfully uploaded: {target_title}")
+                            nlm_titles.add(target_title)
+                            nlm_key_map[parent_key] = target_title
+                            
                             labels_to_apply = item_subcollections.get(parent_key, set())
                             if not labels_to_apply:
                                 labels_to_apply = {col_name}
@@ -469,12 +551,13 @@ def main():
                                 
                             uploaded_count += 1
                             uploaded_metadata.append({
-                                "author": author,
+                                "author": cit_key.split("-")[0] if "-" in cit_key else "Unknown",
                                 "date": date,
                                 "zotero_key": parent_key,
                                 "title": title,
                                 "itemtype": type_name
                             })
+                            existing_keys.add(parent_key)
                         else:
                             print(f"Failed to upload {target_title}:")
                             print(res_upload.stderr)
@@ -493,6 +576,8 @@ def main():
                             except:
                                 pass
                         all_failed_items.append(f"{target_title} (Download/process error)")
+                else:
+                    print(f"[{idx}/{len(parent_items)}] Skipping '{target_title}' (No PDF or HTML attachment found).")
 
         if uploaded_metadata:
             mapping_data["source_library"] = {
@@ -505,9 +590,10 @@ def main():
                 existing_items_dict[item["zotero_key"]] = item
             mapping_data["uploaded_items"] = list(existing_items_dict.values())
             
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(mapping_data, f, indent=2, ensure_ascii=False)
-            print(f"Recorded metadata for {len(uploaded_metadata)} new items in {output_file}")
+            for out_fname in ["_zotero_uploaded_items.json", "zotero_uploaded_items.json"]:
+                with open(out_fname, "w", encoding="utf-8") as f:
+                    json.dump(mapping_data, f, indent=2, ensure_ascii=False)
+            print(f"Recorded metadata for {len(uploaded_metadata)} items in tracking JSON files.")
 
     print("\nSynchronization complete.")
     if all_failed_items:
