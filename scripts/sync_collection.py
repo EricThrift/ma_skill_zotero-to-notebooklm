@@ -290,6 +290,15 @@ def convert_html_to_pdf(html_path, pdf_path):
         print(f"Edge HTML to PDF conversion failed: {res.stderr}")
         return False
 
+def normalize_title(t):
+    if not t:
+        return ""
+    t = t.strip().lower()
+    for ext in ['.pdf', '.html', '.txt', '.doc', '.docx']:
+        if t.endswith(ext):
+            t = t[:-len(ext)]
+    return t
+
 import concurrent.futures
 
 def dump_attachment_with_timeout(zot_client, att_key, local_path, timeout_sec=45):
@@ -443,7 +452,7 @@ def main():
 
         print("Fetching existing NotebookLM sources for duplicate prevention...")
         cmd_list_sources = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "list", "sources", notebook_id, "--json"]
-        nlm_titles = set()
+        nlm_titles_norm = {}
         nlm_key_map = {}
         res_sources = subprocess.run(cmd_list_sources, capture_output=True, text=True, encoding="utf-8")
         if res_sources.returncode == 0:
@@ -452,7 +461,8 @@ def main():
                 for src in sources_list:
                     s_title = src.get("title", "")
                     if s_title:
-                        nlm_titles.add(s_title)
+                        norm = normalize_title(s_title)
+                        nlm_titles_norm[norm] = s_title
                         m = re.search(r'([A-Z0-9]{8})$', s_title)
                         if m:
                             nlm_key_map[m.group(1)] = s_title
@@ -506,10 +516,11 @@ def main():
             
             cit_key = get_zotero_citation_key(zot, item)
             target_title = cit_key
+            target_norm = normalize_title(target_title)
             
             is_in_mapping = parent_key in existing_keys
-            is_in_nlm = (target_title in nlm_titles) or (parent_key in nlm_key_map)
-            matched_nlm_title = target_title if target_title in nlm_titles else nlm_key_map.get(parent_key, target_title)
+            is_in_nlm = (target_norm in nlm_titles_norm) or (parent_key in nlm_key_map)
+            matched_nlm_title = nlm_titles_norm.get(target_norm) or nlm_key_map.get(parent_key, target_title)
             
             is_already_uploaded = is_in_mapping or is_in_nlm
             
@@ -607,7 +618,7 @@ def main():
                             
                         if res_upload.returncode == 0:
                             print(f"Successfully uploaded: {target_title}")
-                            nlm_titles.add(target_title)
+                            nlm_titles_norm[normalize_title(target_title)] = target_title
                             nlm_key_map[parent_key] = target_title
                             
                             labels_to_apply = item_subcollections.get(parent_key, set())
@@ -617,14 +628,17 @@ def main():
                                 label_source(notebook_id, target_title, label)
                                 
                             uploaded_count += 1
-                            uploaded_metadata.append({
+                            item_meta = {
                                 "author": cit_key.split("-")[0] if "-" in cit_key else "Unknown",
                                 "date": date,
                                 "zotero_key": parent_key,
                                 "title": title,
                                 "itemtype": type_name
-                            })
+                            }
+                            uploaded_metadata.append(item_meta)
+                            mapping_data.setdefault("uploaded_items", []).append(item_meta)
                             existing_keys.add(parent_key)
+                            save_tracking_json(output_file, mapping_data)
                         else:
                             print(f"Failed to upload {target_title}:")
                             print(res_upload.stderr)
