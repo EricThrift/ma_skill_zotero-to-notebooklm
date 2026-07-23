@@ -16,10 +16,15 @@ import argparse
 import urllib.request
 import urllib.parse
 import ssl
+import socket
 from pyzotero import zotero
 
-sys.stdout.reconfigure(encoding='utf-8')
-sys.stderr.reconfigure(encoding='utf-8')
+socket.setdefaulttimeout(30)
+
+import io
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
@@ -111,77 +116,103 @@ def get_zotero_citation_key(zot_client, item):
 
     return cit_key
 
-def label_source(notebook_id, source_title, collection_name):
-    """
-    Finds or creates a label in NotebookLM matching the Zotero collection/subcollection name
-    and assigns the uploaded source to that label.
-    """
-    print(f"Finding or creating label for collection '{collection_name}'...")
-    label_id = None
-    
+label_cache = {}
+source_cache = {}
+
+def get_label_id(notebook_id, collection_name):
+    if collection_name in label_cache:
+        return label_cache[collection_name]
+        
     cmd_list_labels = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "label", "list", notebook_id, "--json"]
-    res_list = subprocess.run(cmd_list_labels, capture_output=True, text=True, encoding="utf-8")
-    if res_list.returncode == 0:
-        try:
+    try:
+        res_list = subprocess.run(cmd_list_labels, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        if res_list.returncode == 0:
             data = json.loads(res_list.stdout)
             labels = data if isinstance(data, list) else data.get("labels", [])
             for lbl in labels:
-                if lbl.get("name") == collection_name:
-                    label_id = lbl.get("id")
-                    break
-        except Exception:
-            pass
-            
-    if not label_id:
-        print(f"Label '{collection_name}' not found. Creating it...")
-        cmd_create_label = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "label", "create", notebook_id, collection_name]
-        subprocess.run(cmd_create_label, capture_output=True, text=True, encoding="utf-8")
-        
-        res_list = subprocess.run(cmd_list_labels, capture_output=True, text=True, encoding="utf-8")
-        if res_list.returncode == 0:
-            try:
-                data = json.loads(res_list.stdout)
-                labels = data if isinstance(data, list) else data.get("labels", [])
-                for lbl in labels:
-                    if lbl.get("name") == collection_name:
-                        label_id = lbl.get("id")
-                        break
-            except Exception:
-                pass
+                if lbl.get("name"):
+                    label_cache[lbl["name"]] = lbl.get("id")
+    except Exception:
+        pass
 
-    if not label_id:
-        print(f"Error: Could not resolve or create label '{collection_name}'. Skipping labeling.")
-        return False
+    if collection_name in label_cache:
+        return label_cache[collection_name]
         
-    print(f"Resolving source ID for '{source_title}'...")
-    source_id = None
+    print(f"Creating label '{collection_name}' in NotebookLM...")
+    cmd_create = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "label", "create", notebook_id, collection_name]
+    try:
+        subprocess.run(cmd_create, capture_output=True, text=True, encoding="utf-8", timeout=30)
+    except Exception:
+        pass
+    
+    try:
+        res_list = subprocess.run(cmd_list_labels, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        if res_list.returncode == 0:
+            data = json.loads(res_list.stdout)
+            labels = data if isinstance(data, list) else data.get("labels", [])
+            for lbl in labels:
+                if lbl.get("name"):
+                    label_cache[lbl["name"]] = lbl.get("id")
+    except Exception:
+        pass
+            
+    return label_cache.get(collection_name)
+
+def get_source_id(notebook_id, source_title):
+    if source_title in source_cache:
+        return source_cache[source_title]
+        
     cmd_list_sources = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "list", "sources", notebook_id, "--json"]
     try:
-        res_sources = subprocess.run(cmd_list_sources, capture_output=True, text=True, encoding="utf-8", timeout=60)
+        res_sources = subprocess.run(cmd_list_sources, capture_output=True, text=True, encoding="utf-8", timeout=30)
         if res_sources.returncode == 0:
             sources = json.loads(res_sources.stdout)
             for src in sources:
-                if src.get("title") == source_title:
-                    source_id = src.get("id")
-                    break
+                if src.get("title"):
+                    source_cache[src["title"]] = src.get("id")
+                    m = re.search(r'([A-Z0-9]{8})$', src["title"])
+                    if m:
+                        source_cache[m.group(1)] = src.get("id")
     except Exception as e:
-        print(f"Error parsing sources: {e}")
-        
-    if not source_id:
-        print(f"Error: Source '{source_title}' not found in NotebookLM. Skipping labeling.")
+        print(f"Error refreshing sources cache: {e}")
+
+    if source_title in source_cache:
+        return source_cache[source_title]
+    m = re.search(r'([A-Z0-9]{8})$', source_title)
+    if m and m.group(1) in source_cache:
+        return source_cache[m.group(1)]
+
+    return None
+
+def label_source(notebook_id, source_title, collection_name):
+    label_id = get_label_id(notebook_id, collection_name)
+    if not label_id:
+        print(f"Error: Could not resolve or create label '{collection_name}'")
         return False
         
-    print(f"Assigning source '{source_title}' to label '{collection_name}'...")
+    source_id = get_source_id(notebook_id, source_title)
+    if not source_id:
+        print(f"Error: Could not resolve source ID for '{source_title}'")
+        return False
+        
     cmd_move = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "label", "move", notebook_id, source_id, label_id]
-    res_move = subprocess.run(cmd_move, capture_output=True, text=True, encoding="utf-8")
-    if res_move.returncode == 0:
-        print(f"Successfully labeled '{source_title}' as '{collection_name}'")
-        return True
-    else:
-        print(f"Failed to assign label: {res_move.stderr}")
+    try:
+        res_move = subprocess.run(cmd_move, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        if res_move.returncode == 0:
+            print(f"Successfully labeled '{source_title}' as '{collection_name}'")
+            return True
+        else:
+            print(f"Failed to assign label: {res_move.stderr.strip()}")
+            return False
+    except Exception as e:
+        print(f"Label move command timed out/failed: {e}")
         return False
 
-def resolve_notebook_id(notebook_name):
+def resolve_notebook_id(notebook_name_or_id):
+    if not notebook_name_or_id:
+        return None
+    if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', notebook_name_or_id, re.I):
+        return notebook_name_or_id
     cmd_list = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "notebook", "list", "--json"]
     res = subprocess.run(cmd_list, capture_output=True, text=True, encoding="utf-8")
     if res.returncode == 0:
@@ -189,8 +220,10 @@ def resolve_notebook_id(notebook_name):
             data = json.loads(res.stdout)
             notebooks = data if isinstance(data, list) else data.get("notebooks", [])
             for nb in notebooks:
-                if nb.get("name") == notebook_name:
-                    return nb.get("id")
+                title = nb.get("title") or nb.get("name", "")
+                nb_id = nb.get("id", "")
+                if title.lower() == notebook_name_or_id.lower() or nb_id == notebook_name_or_id:
+                    return nb_id
         except Exception:
             pass
     return None
@@ -257,12 +290,38 @@ def convert_html_to_pdf(html_path, pdf_path):
         print(f"Edge HTML to PDF conversion failed: {res.stderr}")
         return False
 
+import concurrent.futures
+
+def dump_attachment_with_timeout(zot_client, att_key, local_path, timeout_sec=45):
+    # Direct HTTP download via Zotero API
+    endpoint_type = 'groups' if library_type == 'group' else 'users'
+    url = f"https://api.zotero.org/{endpoint_type}/{library_id}/items/{att_key}/file"
+    req = urllib.request.Request(url, headers={"Zotero-API-Key": api_key, "User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec, context=ctx) as response, open(local_path, "wb") as out_file:
+            out_file.write(response.read())
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            return True
+    except Exception as e:
+        print(f"Direct API download failed for {att_key}: {e}. Trying pyzotero fallback...")
+
+    # PyZotero fallback with thread timeout
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(zot_client.dump, att_key, local_path)
+        try:
+            future.result(timeout=timeout_sec)
+            return os.path.exists(local_path) and os.path.getsize(local_path) > 0
+        except Exception as e:
+            print(f"Pyzotero dump failed for {att_key}: {e}")
+            return False
+
 def main():
     parser = argparse.ArgumentParser(description="Synchronize Zotero collections to NotebookLM")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--all", action="store_true", help="Sync all previously uploaded collections")
     group.add_argument("--collection-name", type=str, help="Sync a specific collection by name")
     group.add_argument("--list", action="store_true", help="List currently synchronized collections")
+    parser.add_argument("--notebook-id", type=str, default=None, help="Specific NotebookLM notebook UUID to sync to")
     
     args = parser.parse_args()
     output_file = "zotero_uploaded_items.json"
@@ -293,21 +352,22 @@ def main():
         "uploaded_items": []
     }
     
-    if os.path.exists(output_file):
-        try:
-            with open(output_file, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-                if "uploaded_items" in loaded:
-                    mapping_data["uploaded_items"] = loaded["uploaded_items"]
-        except Exception as e:
-            print(f"Warning: Could not read {output_file}: {e}")
+    for tracking_fn in ["zotero_uploaded_items.json", "_zotero_uploaded_items.json"]:
+        if os.path.exists(tracking_fn):
+            try:
+                with open(tracking_fn, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if "uploaded_items" in loaded:
+                        mapping_data["uploaded_items"].extend(loaded["uploaded_items"])
+            except Exception as e:
+                print(f"Warning: Could not read {tracking_fn}: {e}")
 
-    notebook_name = args.collection_name or mapping_data["source_library"].get("name", "Restorative cataloguing")
-    print(f"Resolving Notebook ID for '{notebook_name}'...")
-    notebook_id = resolve_notebook_id(notebook_name)
+    notebook_target = args.notebook_id or args.collection_name or mapping_data["source_library"].get("name", "Restorative cataloguing")
+    print(f"Resolving Notebook ID for '{notebook_target}'...")
+    notebook_id = resolve_notebook_id(notebook_target)
     if not notebook_id:
-        print(f"Notebook '{notebook_name}' not found. Creating it...")
-        cmd_create = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "notebook", "create", notebook_name, "--json"]
+        print(f"Notebook '{notebook_target}' not found. Creating it...")
+        cmd_create = ["uvx", "--link-mode=copy", "--from", "notebooklm-mcp-cli", "nlm", "notebook", "create", notebook_target, "--json"]
         res_create = subprocess.run(cmd_create, capture_output=True, text=True, encoding="utf-8")
         if res_create.returncode == 0:
             try:
@@ -320,7 +380,7 @@ def main():
             print(f"Error creating notebook: {res_create.stderr}")
             
     if not notebook_id:
-        print(f"Error: Could not resolve NotebookLM notebook '{notebook_name}'")
+        print(f"Error: Could not resolve NotebookLM notebook '{notebook_target}'")
         sys.exit(1)
         
     print(f"Target Notebook ID: {notebook_id}")
@@ -483,13 +543,20 @@ def main():
                     content_type = att["data"].get("contentType")
                     ext = ".html" if content_type == "text/html" else ".pdf"
                     filename = f"{cit_key}{ext}"
-                    
                     print(f"[{idx}/{len(parent_items)}] Downloading attachment '{filename}' for '{target_title}'...")
                     current_dir = os.path.abspath(os.getcwd())
                     local_path = os.path.join(current_dir, filename)
                     upload_path = None
                     try:
-                        zot.dump(att_key, local_path)
+                        if not dump_attachment_with_timeout(zot, att_key, local_path, timeout_sec=60):
+                            all_failed_items.append(f"{target_title} (Attachment download timeout/failed)")
+                            if os.path.exists(local_path):
+                                try:
+                                    os.remove(local_path)
+                                except:
+                                    pass
+                            continue
+                            
                         upload_path = local_path
                         is_html = content_type == "text/html"
                         
